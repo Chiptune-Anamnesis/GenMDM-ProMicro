@@ -16,6 +16,8 @@
 #include <MIDIUSB.h>
 #include <MIDI.h>
 #include <math.h>
+#include <avr/pgmspace.h>
+#include "samples_hex.h"
 
 // Serial MIDI on Pin 0 (Serial1 RX) at 31250 baud - TRS input via 6N137
 MIDI_CREATE_INSTANCE(HardwareSerial, Serial1, serialMIDI);
@@ -59,6 +61,28 @@ byte velocity;
 byte ccvalue2;
 byte bendLSB;
 byte bendMSB;
+
+// Sample playback
+int SPB_flag = 0;
+int SPB_sound = 0;
+int SPB_counter = 0;
+int SPB_speed = 0;
+int SPB_tick = 1;
+int sample_on = 0;
+byte overSamp = 1;
+int SPB_max = 400;
+byte save_speed = 1;
+byte noise_flag = 0;
+byte noise_data = 0;
+byte noise_velocity = 0;
+byte tri_flag = 1;
+
+byte triangle[] = {
+  0b00000001, 0b00000010, 0b00000100, 0b00001000,
+  0b00010000, 0b00100000, 0b01000000, 0b10000000,
+  0b01000000, 0b00100000, 0b00010000, 0b00001000,
+  0b00000100, 0b00000010,
+};
 
 // Polyphonic Handler
 byte polyFlag = 0;
@@ -174,6 +198,7 @@ const byte noiseLookup[] PROGMEM = {
 // ==================== Forward Declarations ====================
 void doNote(byte channel, byte pitch, byte velocity);
 void doNoteOff(byte channel, byte pitch, byte velocity);
+void doSample();
 void doCC(byte channel, byte ccnumber, byte ccvalue);
 void doBend(byte channel, int bend_usb);
 void writeMD(byte page, byte address, byte data);
@@ -256,7 +281,34 @@ void writeFrequency(byte pitch, byte channel) {
 void doNote(byte channel, byte pitch, byte velocity) {
   channel--;
 
-  if (channel <= 5) {
+  // Channel 6 sample mode (when DAC enabled via CC78)
+  if (channel == 5 && sample_on == 1) {
+    if (pitch >= 60) {
+      SPB_sound = pitch % NUM_SAMPLES;
+      if (velocity > 0) {
+        SPB_speed = save_speed;
+        noise_flag = 0;
+        SPB_flag = 1;
+        SPB_counter = 0;
+        SPB_max = (int)pgm_read_word(&sample_length_list[SPB_sound]);
+      } else {
+        SPB_flag = 0;
+      }
+    }
+    if (pitch < 60) {
+      if (velocity > 0) {
+        SPB_flag = 1;
+        SPB_counter = 0;
+        noise_flag = tri_flag;
+        noise_velocity = 7 - (velocity >> 4);
+        SPB_speed = 59 - pitch;
+      } else {
+        SPB_flag = 0;
+      }
+    }
+  }
+
+  else if (channel <= 5) {
     if (velocity > 0) {
       if (polyFlag == 1) {
         for (int i = 0; i < 6; i++) {
@@ -328,6 +380,10 @@ void doNote(byte channel, byte pitch, byte velocity) {
 void doNoteOff(byte channel, byte pitch, byte velocity) {
   channel--;
 
+  if (channel == 5 && sample_on == 1) {
+    SPB_flag = 0;
+  }
+
   if (channel <= 5) {
     if (polyFlag == 1) {
       for (int i = 0; i < 6; i++) {
@@ -360,6 +416,11 @@ void doCC(byte channel, byte ccnumber, byte ccvalue) {
   channel--;
 
   if (channel <= 5) {
+    // Triangle waveform data (CC 100-113)
+    if (ccnumber >= 100 && ccnumber <= 113) {
+      triangle[ccnumber - 100] = ccvalue << 1;
+    }
+
     switch (ccnumber) {
     case 79: // DAC value
       writeMD(0, 0x2a, ccvalue << 1);
@@ -456,6 +517,7 @@ void doCC(byte channel, byte ccnumber, byte ccvalue) {
 
     case 78: // DAC enable
       writeMD(0, 0x2B, ccvalue << 1);
+      sample_on = ccvalue >> 6;
       break;
 
     case 81: bendAmount = ccvalue / 18; break;
@@ -467,7 +529,10 @@ void doCC(byte channel, byte ccnumber, byte ccvalue) {
     case 84: octDiv = ccvalue + 1; break;
     case 85: pitchOffset = ccvalue; break;
 
+    case 86: SPB_speed = ccvalue; save_speed = SPB_speed; break; // Sample speed
     case 87: polyFlag = ccvalue >> 6; break;
+    case 88: overSamp = (ccvalue >> 3) + 1; break; // Oversampling
+    case 89: tri_flag = (ccvalue >> 6) + 1; break; // Triangle wave
 
     case 9: { // Preset select
       byte idx = ccvalue / 8;
@@ -597,6 +662,44 @@ void processUsbMidi() {
   } while (1);
 }
 
+// ==================== Sample Playback ====================
+void doSample() {
+  if (SPB_flag == 1 && sample_on == 1) {
+    if (SPB_counter >= SPB_max && noise_flag == 0) {
+      SPB_flag = 0;
+      SPB_counter = 0;
+    }
+
+    if (SPB_tick >= SPB_speed && noise_flag == 1) {
+      SPB_counter = SPB_counter + overSamp;
+      SPB_tick = 0;
+      noise_data = byte(random(256)) >> noise_velocity;
+      writeMD(0, 0x2a, noise_data);
+    }
+
+    if (SPB_tick >= SPB_speed && noise_flag == 2) {
+      SPB_counter = SPB_counter + overSamp;
+      SPB_tick = 0;
+      noise_data = triangle[SPB_counter % 14] >> noise_velocity;
+      writeMD(0, 0x2a, noise_data);
+    }
+
+    else if (SPB_tick >= SPB_speed && noise_flag == 0) {
+      SPB_tick = 0;
+      if (SPB_sound < NUM_SAMPLES) {
+        const uint8_t* smp = (const uint8_t*)pgm_read_ptr(&sample_ptrs[SPB_sound]);
+        writeMD(0, 0x2a, pgm_read_byte(smp + SPB_counter));
+      }
+      SPB_counter = SPB_counter + overSamp;
+      SPB_tick = 0;
+    }
+
+    if (SPB_tick < SPB_speed) {
+      SPB_tick = SPB_tick + 1;
+    }
+  }
+}
+
 // ==================== Setup ====================
 void setup() {
   pinMode(PIN_D0, OUTPUT);
@@ -659,6 +762,7 @@ void setup() {
 
 // ==================== Main Loop ====================
 void loop() {
+  doSample();
   serialMIDI.read();  // TRS MIDI input
   processUsbMidi();   // USB MIDI input
 }
